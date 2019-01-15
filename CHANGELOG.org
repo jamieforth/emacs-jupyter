@@ -1,5 +1,10 @@
 * master
 
+- If code is sent to a kernel using a REPL client, and the kernel is able to
+  open files using the =EDITOR= environment variable, whose value is set to
+  =emacsclient=, the files opened are automatically associated with the
+  corresponding REPL. See =jupyter-server-mode-set-client=.
+
 - In =org-mode=, when inserting the results of an asynchronously evaluated
   src-block, indent the results to match the surrounding indentation level.
 
