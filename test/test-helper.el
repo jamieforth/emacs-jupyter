@@ -33,8 +33,12 @@
 (require 'jupyter-comm-layer)
 (require 'jupyter-org-client)
 (require 'jupyter-kernel-manager)
+(require 'org-element)
+(require 'subr-x)
 (require 'cl-lib)
 (require 'ert)
+
+(declare-function jupyter-servers "jupyter-server")
 
 ;; Increase timeouts when testing for consistency. I think what is going on is
 ;; that communication with subprocesses gets slowed down when many processes
@@ -60,11 +64,6 @@ start a new kernel REPL instead of re-using one.")
 (make-directory (expand-file-name "tmp" jupyter-test-temporary-directory))
 
 (message "system-configuration %s" system-configuration)
-
-(add-hook
- 'kill-emacs-hook
- (lambda ()
-   (ignore-errors (delete-directory jupyter-test-temporary-directory))))
 
 ;;; `jupyter-echo-client'
 
@@ -176,6 +175,12 @@ If the `current-buffer' is not a REPL, this is identical to
   `(let ((default-directory jupyter-test-temporary-directory)
          (temporary-file-directory jupyter-test-temporary-directory)
          (tramp-cache-data (make-hash-table :test #'equal)))
+     (let ((port (jupyter-test-ensure-notebook-server)))
+       (dolist (method '("jpys" "jpy"))
+         (setf
+          (alist-get 'tramp-default-port
+                     (alist-get method tramp-methods nil nil #'equal))
+          (list port))))
      ,@body))
 
 (defmacro jupyter-with-echo-client (client &rest body)
@@ -270,7 +275,7 @@ running BODY."
   `(jupyter-test-with-kernel-repl "python" ,client
      ,@body))
 
-(defmacro jupyter-test-rest-api (bodyform &rest check-forms)
+(defmacro jupyter-test-rest-api-request (bodyform &rest check-forms)
   "Replace the body of `url-retrieve*' with CHECK-FORMS, evaluate BODYFORM.
 For `url-retrieve', the callback will be called with a nil status."
   (declare (indent 1))
@@ -299,6 +304,33 @@ For `url-retrieve', the callback will be called with a nil status."
                           (funcall fun url)
                         (apply cb nil cbargs)))))
            ,bodyform)))))
+
+(defmacro jupyter-test-rest-api-with-notebook (client &rest body)
+  (declare (indent 1))
+  `(let* ((url-cookie-storage nil)
+          (url-cookie-secure-storage nil)
+          (host (format "localhost:%s" (jupyter-test-ensure-notebook-server)))
+          (,client (jupyter-rest-client :url (format "http://%s" host))))
+     ,@body))
+
+(defmacro jupyter-test-with-notebook (server &rest body)
+  (declare (indent 1))
+  `(let* ((host (format "localhost:%s" (jupyter-test-ensure-notebook-server)))
+          (url (format "http://%s" host))
+          (,server (or (jupyter-find-server url)
+                       (jupyter-server :url url))))
+     ,@body))
+
+(defmacro jupyter-test-with-server-kernel (server name kernel &rest body)
+  (declare (indent 3))
+  (let ((id (make-symbol "id")))
+    `(let ((,kernel (jupyter-server-kernel
+                     :spec (jupyter-guess-kernelspec
+                            ,name (jupyter-server-kernelspecs ,server)))))
+       (let ((,id (jupyter-start-kernel kernel server)))
+         (unwind-protect
+             (progn ,@body)
+           (jupyter-api-shutdown-kernel ,server ,id))))))
 
 ;;; Functions
 
@@ -385,6 +417,14 @@ should have PROP with VAL."
    if (or (null positions) (memq i positions))
    do (should (equal (get-text-property i prop) val))
    else do (should-not (get-text-property i prop))))
+
+(defun jupyter-test-kill-buffer (buffer)
+  "Kill BUFFER, defaulting to yes for all `kill-buffer-query-functions'."
+  (cl-letf (((symbol-function 'yes-or-no-p)
+             (lambda (_prompt) t))
+            ((symbol-function 'y-or-n-p)
+             (lambda (_prompt) t)))
+    (kill-buffer buffer)))
 
 ;;; `org-mode'
 
@@ -546,11 +586,43 @@ see the documentation on the --NotebookApp.password argument."
                       port))
           (sleep-for 5))))))
 
-(add-hook 'kill-emacs-hook
-          (lambda ()
-            (ignore-errors
-              (message "%s" (with-current-buffer
-                                (process-buffer (car jupyter-test-notebook))
-                              (buffer-string))))))
+;;; Cleanup
+
+(when (or (getenv "APPVEYOR") (getenv "TRAVIS"))
+  (add-hook 'kill-emacs-hook
+            (lambda ()
+              (ignore-errors
+                (message "%s" (with-current-buffer
+                                  (process-buffer (car jupyter-test-notebook))
+                                (buffer-string)))))))
+
+(defvar jupyter-test-zmq-sockets (make-hash-table :weakness 'key))
+
+(advice-add 'zmq-socket
+            :around (lambda (&rest args)
+                      (let ((sock (apply args)))
+                        (prog1 sock
+                          (puthash sock t jupyter-test-zmq-sockets)))))
+
+;; Do lots of cleanup to avoid core dumps on Travis due to epoll reconnect
+;; attempts.
+(add-hook
+ 'kill-emacs-hook
+ (lambda ()
+   (ignore-errors (delete-directory jupyter-test-temporary-directory))
+   (ignore-errors (delete-process (car jupyter-test-notebook)))
+   (cl-loop for server in (jupyter-servers)
+            do (ignore-errors (jupyter-comm-stop server)))
+   (cl-loop
+    for client in (jupyter-clients)
+    do (ignore-errors (jupyter-stop-channels client))
+    (when (oref client manager)
+      (ignore-errors (jupyter-shutdown-kernel (oref client manager)))))
+   (cl-loop
+    for sock being the hash-keys of jupyter-test-zmq-sockets do
+    (ignore-errors
+      (zmq-set-option sock zmq-LINGER 0)
+      (zmq-close sock)))
+   (ignore-errors (zmq-context-terminate (zmq-current-context)))))
 
 ;;; test-helper.el ends here
