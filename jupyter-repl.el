@@ -297,6 +297,36 @@ BEG and END are within an input/output cell."
                      ,@output-forms))))
              (setq ,start ,next)))))))
 
+(defmacro jupyter-repl-inhibit-undo-when (cond &rest body)
+  "Evaluate BODY, disabling undo beforehand if COND is non-nil.
+Undo is re-enabled after BODY is evaluated.
+
+Note, any changes to `buffer-undo-list' during evaluation of BODY
+will not be present when undo is re-enabled if COND is non-nil."
+  (declare (indent 1) (debug ([&or symbolp form] &rest form)))
+  (let ((new-undo-list (make-symbol "new"))
+        (disable-undo (make-symbol "disable")))
+    `(let ((,disable-undo ,cond) ,new-undo-list)
+       (let ((buffer-undo-list (if ,disable-undo t buffer-undo-list)))
+         (unwind-protect
+             (progn ,@body)
+           (unless ,disable-undo
+             (setq ,new-undo-list buffer-undo-list))))
+       (when ,new-undo-list
+         (setq buffer-undo-list ,new-undo-list)))))
+
+(defmacro jupyter-repl-with-single-undo (&rest body)
+  "Evaluate BODY, remove all undo boundaries created during its evaluation."
+  (declare (indent 0) (debug (&rest form)))
+  (let ((handle (make-symbol "handle")))
+    `(let ((,handle (prepare-change-group)))
+       (unwind-protect
+           (progn
+             (activate-change-group ,handle)
+             ,@body)
+         (undo-amalgamate-change-group ,handle)
+         (accept-change-group ,handle)))))
+
 ;;; Text insertion
 
 (defun jupyter-repl-insert (&rest args)
@@ -319,8 +349,7 @@ can contain the following keywords along with their values:
   (let ((arg nil)
         (read-only t)
         (properties nil)
-        (insert-fun #'insert)
-        (buffer-undo-list t))
+        (insert-fun #'insert))
     (while (keywordp (setq arg (car args)))
       (cl-case arg
         (:read-only (setq read-only (cadr args)))
@@ -330,14 +359,14 @@ can contain the following keywords along with their values:
         (otherwise
          (error "Keyword not one of `:read-only', `:properties', `:inherit-' (`%s')" arg)))
       (setq args (cddr args)))
-    (setq properties (append (when read-only '(read-only t))
-                             properties))
-    (apply insert-fun (mapcar (lambda (s)
-                           (prog1 s
-                             (when properties
-                               (add-text-properties
-                                0 (length s) properties s))))
-                         args))))
+    (when read-only
+      (push t properties)
+      (push 'read-only properties))
+    (when properties
+      (dolist (s args)
+        (add-text-properties 0 (length s) properties s)))
+    (jupyter-repl-inhibit-undo-when read-only
+      (apply insert-fun args))))
 
 (defun jupyter-repl-newline ()
   "Insert a read-only newline into the `current-buffer'."
@@ -430,7 +459,7 @@ interpreted as `in'."
   (jupyter-repl-without-continuation-prompts
    (let ((inhibit-read-only t))
      ;; The newline that `jupyter-repl--make-prompt' will overlay.
-     (jupyter-repl-newline)
+     (jupyter-repl-insert :read-only (not (eq type 'continuation)) "\n")
      (cond
       ((eq type 'in)
        (let ((count (oref jupyter-current-client execution-count)))
@@ -760,10 +789,19 @@ Place `point' at `point-max'."
     (setq buffer-undo-list '((t . 0)))))
 
 (defun jupyter-repl-replace-cell-code (new-code)
-  "Replace the current cell code with NEW-CODE."
-  (goto-char (jupyter-repl-cell-code-beginning-position))
-  (delete-region (point) (jupyter-repl-cell-code-end-position))
-  (jupyter-repl-insert :inherit t :read-only nil new-code))
+  "Replace the current cell code with NEW-CODE.
+If NEW-CODE is a buffer use `replace-buffer-contents' to replace
+the cell code. Otherwise NEW-CODE should be a string, the current
+cell code will be erased and NEW-CODE inserted in its place."
+  (if (bufferp new-code)
+      (jupyter-with-repl-cell
+        (jupyter-repl-with-single-undo
+          ;; Need to create a single undo step here because
+          ;; `replace-buffer-contents' adds in unwanted undo boundaries.
+          (replace-buffer-contents new-code)))
+    (goto-char (jupyter-repl-cell-code-beginning-position))
+    (delete-region (point) (jupyter-repl-cell-code-end-position))
+    (jupyter-repl-insert :inherit t :read-only nil new-code)))
 
 (defun jupyter-repl-truncate-buffer ()
   "Truncate the `current-buffer' based on `jupyter-repl-maximum-size'.
@@ -1121,7 +1159,7 @@ elements."
       ("complete"
        (jupyter-send-execute-request client))
       ("incomplete"
-       (jupyter-repl-newline)
+       (jupyter-repl-insert :read-only nil "\n")
        (if (= (length indent) 0) (jupyter-repl-indent-line)
          (jupyter-repl-insert :read-only nil indent)))
       ("invalid"
@@ -1237,7 +1275,7 @@ Reset `jupyter-repl-use-builtin-is-complete' to nil if this is only temporary.")
                    (jupyter-indent-line)
                    (unless (eq tick (buffer-chars-modified-tick))
                      (setq pos (point))
-                     (buffer-string))))))
+                     (current-buffer))))))
     ;; Don't modify the buffer when unnecessary, this allows
     ;; `company-indent-or-complete-common' to work.
     (when replacement
