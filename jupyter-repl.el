@@ -799,7 +799,23 @@ cell code will be erased and NEW-CODE inserted in its place."
         (jupyter-repl-with-single-undo
           ;; Need to create a single undo step here because
           ;; `replace-buffer-contents' adds in unwanted undo boundaries.
-          (replace-buffer-contents new-code)))
+          ;;
+          ;; Tests failing on Appveyor due to `replace-buffer-contents' not
+          ;; supplying the right arguments to `after-change-functions' so call
+          ;; the change functions manually. Seen on Emacs 26.1.
+          ;;
+          ;; For reference see https://debbugs.gnu.org/cgi/bugreport.cgi?bug=32278
+          (let ((inhibit-modification-hooks t)
+                (beg (point-min))
+                (end (point-max))
+                (new-len (with-current-buffer new-code
+                           (- (point-max) (point-min)))))
+            (run-hook-with-args
+             'before-change-functions beg end)
+            (replace-buffer-contents new-code)
+            (run-hook-with-args
+             'after-change-functions
+             beg (+ beg new-len) (- end beg)))))
     (goto-char (jupyter-repl-cell-code-beginning-position))
     (delete-region (point) (jupyter-repl-cell-code-end-position))
     (jupyter-repl-insert :inherit t :read-only nil new-code)))
@@ -1356,7 +1372,14 @@ meaning as in `after-change-functions'."
             (when (and (= len 1)
                        (get-text-property beg 'rear-nonsticky)
                        (= end (jupyter-repl-cell-end-position)))
-              (remove-text-properties beg end '(rear-nonsticky))))))))))
+              (remove-text-properties beg end '(rear-nonsticky))))
+           ;; Post change inserted text in the region
+           ((> (- end beg) len)
+            (jupyter-repl-after-change 'insert beg end))
+           ;; Post change deleted text
+           (t
+            ;; FIXME: This is probably wrong.
+            (jupyter-repl-after-change 'delete beg (- len (- end beg))))))))))
 
 (cl-defgeneric jupyter-repl-after-change (_type _beg _end-or-len)
   "Called from the `after-change-functions' of a REPL buffer.
